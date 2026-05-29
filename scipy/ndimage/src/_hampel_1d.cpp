@@ -305,6 +305,23 @@ private:
     }
 };
 
+// Brute-force MAD at position i: read the W window values, compute
+// |x_j - M| for each, and find the median deviation via nth_element.
+// O(W) expected time. Used as a fallback when the equilibrium loop
+// would take too many iterations.
+template <typename T>
+static inline double mad_brute_force(const T *signal, npy_intp N, npy_intp i,
+                                     int W, int Z, T M, int mode, T cval,
+                                     double *dev_buf)
+{
+    for (int j = 0; j < W; ++j) {
+        T val = read_padded(signal, N, i + j, Z, mode, cval);
+        dev_buf[j] = std::fabs((double)val - (double)M);
+    }
+    std::nth_element(dev_buf, dev_buf + Z, dev_buf + W);
+    return dev_buf[Z];
+}
+
 // Core Hampel kernel. Returns 0 on success, -1 on memory failure.
 //
 // For every position i in [0, N) the local median M = median_in[i] is
@@ -313,6 +330,13 @@ private:
 // to extract MAD(i) in O(log W). If |signal[i] - M| > threshold * MAD(i)
 // the sample is flagged as an outlier and replaced by M in `filtered`;
 // otherwise the original value is kept.
+//
+// Adaptive bailout: if the equilibrium loop exceeds max_iter iterations
+// (set to floor(log2(W)) + 1), we abandon it and compute MAD directly
+// via brute-force nth_element in O(W). This caps the worst-case total
+// cost at O(N * W) instead of O(N * W * log W) for pathological inputs
+// (e.g. perfectly alternating signals), while leaving the O(N log W)
+// typical case untouched.
 template <typename T>
 int _hampel_1d(const T *signal, const T *median_in, npy_intp N, int win_len,
                double threshold, int mode, T cval,
@@ -331,6 +355,12 @@ int _hampel_1d(const T *signal, const T *median_in, npy_intp N, int win_len,
         return 0;
     }
 
+    // Bailout threshold: floor(log2(W)) + 1. For typical signals the
+    // equilibrium loop converges in O(1) iterations; only pathological
+    // inputs (median toggling every step) approach Z iterations.
+    int max_iter = 1;
+    for (int v = W; v > 1; v >>= 1) max_iter++;
+
     // Equilibrium-loop parameters: 1-based internal "median rank".
     int M_rank = Z + 1;
     int k_L = Z / 2;
@@ -339,6 +369,8 @@ int _hampel_1d(const T *signal, const T *median_in, npy_intp N, int win_len,
     try {
         RankTracker<T> upper_tracker(W, M_rank + k_U);
         RankTracker<T> lower_tracker(W, M_rank - k_L - 1);
+
+        std::vector<double> dev_buf(W);
 
         // Initial window covers padded positions [0, W). Each one lives at
         // slot (j % W) == j.
@@ -364,11 +396,21 @@ int _hampel_1d(const T *signal, const T *median_in, npy_intp N, int win_len,
             }
 
             T M = median_in[i];
+            double mad;
 
             // Re-balance k_U / k_L until the (k_U)th value above M and the
             // (k_L)th value below M jointly bracket the same rank distance.
             // All distances are computed in double to avoid int64 overflow.
+            // If convergence takes more than max_iter steps, fall back to
+            // brute-force MAD computation.
+            int iter = 0;
+            bool converged = true;
             while (true) {
+                if (iter++ >= max_iter) {
+                    converged = false;
+                    break;
+                }
+
                 T X_upper_k = upper_tracker.get_kth_value();
                 T X_upper_next = upper_tracker.get_kplus1_value();
 
@@ -395,9 +437,14 @@ int _hampel_1d(const T *signal, const T *median_in, npy_intp N, int win_len,
                 }
             }
 
-            double cand_A = (k_U > 0) ? signed_dist(upper_tracker.get_kth_value(), M) : 0.0;
-            double cand_B = (k_L > 0) ? signed_dist(M, lower_tracker.get_kplus1_value()) : 0.0;
-            double mad = std::max({cand_A, cand_B, 0.0});
+            if (converged) {
+                double cand_A = (k_U > 0) ? signed_dist(upper_tracker.get_kth_value(), M) : 0.0;
+                double cand_B = (k_L > 0) ? signed_dist(M, lower_tracker.get_kplus1_value()) : 0.0;
+                mad = std::max({cand_A, cand_B, 0.0});
+            } else {
+                mad = mad_brute_force(signal, N, i, W, Z, M, mode, cval,
+                                      dev_buf.data());
+            }
 
             double abs_dev = abs_diff(signal[i], M);
             // All operands are double, avoiding int64 overflow on
